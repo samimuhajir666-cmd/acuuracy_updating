@@ -1,301 +1,231 @@
 import io
 import os
-import re
-import html
-import requests
+import json
 import numpy as np
-import scipy.io.wavfile as wav
 import scipy.signal as signal
 import noisereduce as nr
 import streamlit as st
-from dotenv import load_dotenv
-from streamlit_mic_recorder import mic_recorder
-from unidecode import unidecode
-from groq import Groq
+from pathlib import Path
+from datetime import datetime
+from faster_whisper import WhisperModel
 
-# ============================
-# 🖥️ STREAMLIT PAGE CONFIG
-# ============================
-st.set_page_config(
-    page_title="AI Agent - Speech to Text & Brain",
-    page_icon="🎤",
-    layout="centered",
-)
-
-load_dotenv()
-
-# ============================
-# 🔑 API KEYS SETUP
-# ============================
-DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
-if not DEEPGRAM_API_KEY:
-    try:
-        DEEPGRAM_API_KEY = st.secrets.get("DEEPGRAM_API_KEY")
-    except Exception:
-        DEEPGRAM_API_KEY = None
-
-if not DEEPGRAM_API_KEY:
-    st.error("DEEPGRAM_API_KEY not found. Put it in .env or Streamlit Secrets.")
-    st.stop()
-
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-if not GROQ_API_KEY:
-    try:
-        GROQ_API_KEY = st.secrets.get("GROQ_API_KEY")
-    except Exception:
-        GROQ_API_KEY = None
-
-if not GROQ_API_KEY:
-    st.error("GROQ_API_KEY not found. Put it in .env or Streamlit Secrets.")
-    st.stop()
-
-# Initialize Groq Client for LLM Response
-try:
-    groq_client = Groq(api_key=GROQ_API_KEY)
-except Exception as e:
-    st.error(f"Groq Client Initialization Error: {e}")
-    st.stop()
-
-# ============================
-# 🎙️ DEEPGRAM CONFIGURATION
-# ============================
-DEEPGRAM_API_URL = "https://api.deepgram.com/v1/listen"
-DEEPGRAM_MODEL = "nova-3"
-DEEPGRAM_LANGUAGE = "multi"
-DEEPGRAM_TIMEOUT = 60
-
-DEEPGRAM_KEYTERMS = [
-    "Python", "Streamlit", "Jupyter", "Matplotlib", "Plotly",
-    "NumPy", "SciPy", "Deepgram", "AI", "machine learning",
-    "deep learning", "API", "API key", "variable", "function",
-    "class", "list", "dictionary", "tuple", "integer", "string",
-    "float", "Flask", "FastAPI", "JavaScript", "HTML", "CSS",
-]
-
-def force_roman_script(text):
-    if not text:
-        return text
-    has_non_ascii = bool(re.search(r'[^\x00-\x7F]', text))
-    if not has_non_ascii:
-        return text
-    return unidecode(text)
-
-# ============================
-# 🎙️ DEEPGRAM TRANSCRIBE
-# ============================
-def transcribe_with_deepgram(processed_bytes, debug=False):
-    params = [
-        ("model", DEEPGRAM_MODEL),
-        ("language", DEEPGRAM_LANGUAGE),
-        ("smart_format", "true"),
-        ("punctuate", "true"),
-        ("utterances", "true"),
-        ("numerals", "true"),
-    ]
-
-    for term in DEEPGRAM_KEYTERMS:
-        params.append(("keyterm", term))
-
-    headers = {
-        "Authorization": f"Token {DEEPGRAM_API_KEY}",
-        "Content-Type": "audio/wav",
-    }
-
-    try:
-        response = requests.post(
-            DEEPGRAM_API_URL,
-            params=params,
-            headers=headers,
-            data=processed_bytes,
-            timeout=DEEPGRAM_TIMEOUT,
+# ==============================================================================
+# 🛠️ TRANSCRIPTION SERVICE CLASS (YOUR ENGINE WITH BACKGROUND & LOUDNESS FIXES)
+# ==============================================================================
+class TranscriptionService:
+    """Production-ready transcription service using faster-whisper with DSP overrides."""
+    
+    def __init__(self, model_size="base", device="cpu", compute_type="int8"):
+        """Initialize the transcription service."""
+        st.write(f"🔄 Waking up AI Engine: `{model_size}` on `{device}` ({compute_type})...")
+        self.model = WhisperModel(
+            model_size,
+            device=device,
+            compute_type=compute_type
         )
-    except requests.RequestException as e:
-        if debug:
-            st.exception(e)
-        raise RuntimeError(f"Could not reach Deepgram: {e}") from e
-
-    if response.status_code != 200:
-        detail = response.text[:1200]
-        raise RuntimeError(f"Deepgram API error {response.status_code}: {detail}")
-
-    try:
-        data = response.json()
-    except Exception as e:
-        raise RuntimeError("Deepgram returned invalid JSON.") from e
-
-    results = data.get("results", {})
-    channels = results.get("channels", [])
-
-    if not channels:
-        return {"text": "", "confidence": 0.0, "raw": data}
-
-    alternatives = channels[0].get("alternatives", [])
-    if not alternatives:
-        return {"text": "", "confidence": 0.0, "raw": data}
-
-    alternative = alternatives[0]
-    transcript = (alternative.get("transcript") or "").strip()
-    confidence = float(alternative.get("confidence", 0.0) or 0.0)
-
-    return {
-        "text": force_roman_script(transcript),
-        "confidence": confidence,
-        "raw": data,
-    }
-
-# ============================
-# 🎚️ AUDIO PROCESSING HELPERS (Noise & VAD)
-# ============================
-MIN_RMS_ENERGY = 55.0
-#old is 35.0
-MIN_DURATION_SECONDS = 0.45
-
-MAX_DURATION_SECONDS = 120
-VAD_FRAME_MS = 30
-MIN_SPEECH_SECONDS = 0.20
-NOISE_FLOOR_PERCENTILE = 10
-SPEECH_ABOVE_NOISE_FACTOR = 2.0
-
-def frame_energies(audio_data, sample_rate, frame_ms=VAD_FRAME_MS):
-    frame_len = max(1, int(sample_rate * frame_ms / 1000))
-    energies = []
-    for start in range(0, len(audio_data), frame_len):
-        chunk = audio_data[start:start + frame_len]
-        if len(chunk) == 0:
-            continue
-        energies.append(float(np.sqrt(np.mean(chunk.astype(np.float64) ** 2))))
-    return energies
-
-def contains_real_speech(audio_data, sample_rate):
-    if audio_data is None or len(audio_data) == 0:
-        return False
-    energies = frame_energies(audio_data, sample_rate)
-    if not energies:
-        return False
-    noise_floor = np.percentile(energies, NOISE_FLOOR_PERCENTILE)
-    dynamic_threshold = max(noise_floor * SPEECH_ABOVE_NOISE_FACTOR, MIN_RMS_ENERGY)
-    speech_frame_count = sum(1 for energy in energies if energy > dynamic_threshold)
-    speech_seconds = speech_frame_count * VAD_FRAME_MS / 1000.0
-    return speech_seconds >= MIN_SPEECH_SECONDS
-
-def process_audio_buffer(audio_bytes, debug=False):
-    try:
-        audio_file = io.BytesIO(audio_bytes)
-        sample_rate, audio_data = wav.read(audio_file)
-
-        if sample_rate <= 0:
-            return None
-
-        if len(audio_data.shape) > 1:
-            audio_data = np.mean(audio_data, axis=1)
-
-        audio_data = audio_data.astype(np.float64)
-        duration = len(audio_data) / float(sample_rate)
-
-        if duration < MIN_DURATION_SECONDS or duration > MAX_DURATION_SECONDS:
-            return None
-
-        if not contains_real_speech(audio_data, sample_rate):
-            return None
-
-        audio_data = np.clip(audio_data, -32768, 32767).astype(np.int16)
-        output_buffer = io.BytesIO()
-        wav.write(output_buffer, sample_rate, audio_data)
-        output_buffer.seek(0)
-
-        return {
-            "processed_bytes": output_buffer.read(),
-            "sample_rate": int(sample_rate),
-            "duration": float(duration),
-        }
-    except Exception as e:
-        if debug:
-            st.exception(e)
-        return None
-
-# ============================
-# 🧠 SESSION STATE
-# ============================
-if "last_transcription" not in st.session_state:
-    st.session_state.last_transcription = ""
-if "ai_response" not in st.session_state:
-    st.session_state.ai_response = ""
-
-# ============================
-# 🧩 UI DESIGN & LAYOUT
-# ============================
-st.title("🎤 AI Speech-to-Text & Agent Brain")
-st.caption("Deepgram Nova-3 • Groq Llama-3.1-8b-instant")
-st.info("Record your voice below. The agent will transcribe your voice.")
-
-# Microphone Widget
-audio_output = mic_recorder(
-    start_prompt="🔴 Record Voice",
-    stop_prompt="⏹️ Stop Recording",
-    just_once=True,
-    use_container_width=True,
-    format="wav",
-    key="listener_mic",
-)
-
-if audio_output:
-    audio_bytes = audio_output.get("bytes")
-
-    if audio_bytes:
-        with st.spinner("⏳ Processing audio buffer & filtering noise..."):
-            result = process_audio_buffer(audio_bytes)
-
-        if result is None:
-            st.warning("⚠️ Recording was too quiet or short. Please speak clearly and try again.")
+        st.write("✅ AI Brain loaded successfully!")
+    
+    def apply_advanced_acoustic_cleanup(self, audio_path):
+        """
+        Applies mathematical filters to stabilize loud voices (shouting) 
+        and eliminate background machinery/room noise floors before AI parsing.
+        """
+        import scipy.io.wavfile as wav
+        
+        # Load the raw audio data array safely
+        sample_rate, data = wav.read(audio_path)
+        
+        # 1. Convert to floating point representation for precise matrix calculations
+        if data.dtype == np.int16:
+            audio_float = data.astype(np.float32) / 32768.0
+        elif data.dtype == np.int32:
+            audio_float = data.astype(np.float32) / 2147483648.0
         else:
-            processed_bytes = result["processed_bytes"]
+            audio_float = data.astype(np.float32)
+            
+        # Handle multi-channel stereo down to uniform mono
+        if len(audio_float.shape) > 1:
+            audio_float = np.mean(audio_float, axis=1)
+            
+        # 2. AUTOMATIC GAIN CONTROL (AGC) & LIMITER FOR LOUD SHOUTING VOICES
+        # If someone speaks too loudly, this squashes the clipping peaks smoothly
+        max_peak = np.max(np.abs(audio_float))
+        if max_peak > 0.70:
+            # Apply soft-knee compression scaling matrix to normalize loud volumes
+            audio_float = np.tanh(audio_float / max_peak) * 0.70
+            
+        # 3. BUTTERWORTH BANDPASS FILTER (Clears low hums and high static hiss)
+        nyquist = 0.5 * sample_rate
+        low_cutoff = 85.0 / nyquist
+        high_cutoff = min(3800.0 / nyquist, 0.99)
+        b, a = signal.butter(4, [low_cutoff, high_cutoff], btype="band")
+        filtered_audio = signal.filtfilt(b, a, audio_float)
+        
+        # 4. ADAPTIVE BACKGROUND NOISE CANCELER (Removes background fan/traffic noise)
+        reduced_noise = nr.reduce_noise(
+            y=filtered_audio, 
+            sr=sample_rate, 
+            prop_decrease=0.85, # Drop noise signature by 85%
+            n_fft=1024
+        )
+        
+        # Convert back safely to standard production 16-bit PCM integer WAV formatting
+        clean_signal = np.clip(reduced_noise * 32768.0, -32768, 32767).astype(np.int16)
+        
+        # Overwrite the temporary file with our pristine, filtered audio track
+        cleaned_path = audio_path.parent / f"cleaned_{audio_path.name}"
+        wav.write(cleaned_path, sample_rate, clean_signal)
+        return cleaned_path
+    
+    def transcribe_file(self, audio_path, output_format="txt", **kwargs):
+        """
+        Transcribe an audio file with custom acoustic preprocessing hooks.
+        """
+        audio_path = Path(audio_path)
+        if not audio_path.exists():
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+            
+        # Execute background filtering and loud-speaker stabilization layers first
+        with st.spinner("🧼 Cleaning background noise and balancing loud vocal peaks..."):
+            cleaned_audio_target = self.apply_advanced_acoustic_cleanup(audio_path)
+        
+        # Transcribe clean audio tracking parameters
+        segments, info = self.model.transcribe(
+            str(cleaned_audio_target),
+            word_timestamps=True,
+            **kwargs
+        )
+        
+        # Collect results data layout
+        result = {
+            "file": str(audio_path.name),
+            "language": info.language,
+            "language_probability": info.language_probability,
+            "duration": info.duration,
+            "segments": []
+        }
+        
+        full_text_parts = []
+        for segment in segments:
+            segment_data = {
+                "start": segment.start,
+                "end": segment.end,
+                "text": segment.text,
+                "words": [
+                    {
+                        "word": word.word,
+                        "start": word.start,
+                        "end": word.end,
+                        "probability": word.probability
+                    }
+                    for word in segment.words
+                ]
+            }
+            result["segments"].append(segment_data)
+            full_text_parts.append(segment.text)
+        
+        result["text"] = " ".join(full_text_parts)
+        
+        # Generate export paths safely inside temporary workspace
+        output_path = audio_path.parent / f"{audio_path.stem}_transcript"
+        
+        if output_format == "txt":
+            self._save_txt(result, output_path.with_suffix(".txt"))
+            final_file = output_path.with_suffix(".txt")
+        elif output_format == "json":
+            self._save_json(result, output_path.with_suffix(".json"))
+            final_file = output_path.with_suffix(".json")
+        elif output_format == "srt":
+            self._save_srt(result, output_path.with_suffix(".srt"))
+            final_file = output_path.with_suffix(".srt")
+        elif output_format == "vtt":
+            self._save_vtt(result, output_path.with_suffix(".vtt"))
+            final_file = output_path.with_suffix(".vtt")
+            
+        # Clean up temporary processing step files to preserve host disk space
+        if cleaned_audio_target.exists():
+            os.remove(cleaned_audio_target)
+            
+        return result, final_file
 
-            # 1. Deepgram Transcription
-            with st.spinner("⚡ Transcribing with Deepgram Nova-3..."):
-                try:
-                    transcription_result = transcribe_with_deepgram(processed_bytes)
-                    text_from_voice = transcription_result["text"].strip()
-                    confidence = float(transcription_result["confidence"])
+    def _save_txt(self, result, path):
+        """Save as plain text."""
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(result["text"])
+    
+    def _save_json(self, result, path):
+        """Save as JSON."""
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, ensure_ascii=False)
+    
+    def _save_srt(self, result, path):
+        """Save as SRT subtitles."""
+        with open(path, "w", encoding="utf-8") as f:
+            for i, seg in enumerate(result["segments"], start=1):
+                start = self._format_srt_time(seg["start"])
+                end = self._format_srt_time(seg["end"])
+                f.write(f"{i}\n{start} --> {end}\n{seg['text']}\n\n")
+    
+    def _save_vtt(self, result, path):
+        """Save as WebVTT."""
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("WEBVTT\n\n")
+            for seg in result["segments"]:
+                start = self._format_vtt_time(seg["start"])
+                end = self._format_vtt_time(seg["end"])
+                f.write(f"{start} --> {end}\n{seg['text']}\n\n")
+    
+    def _format_srt_time(self, seconds):
+        """Format time for SRT."""
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        millis = int((seconds % 1) * 1000)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+    
+    def _format_vtt_time(self, seconds):
+        """Format time for VTT."""
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        millis = int((seconds % 1) * 1000)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
 
-                    if text_from_voice:
-                        st.session_state.last_transcription = text_from_voice
-                        st.success("✅ Transcribed successfully using Deepgram Nova-3")
-                        st.markdown(f"**User Said:** {text_from_voice}")
-                        st.caption(f"Confidence: {confidence:.2f}")
+# ==============================================================================
+# 🖥️ STREAMLIT WEB INTERFACE LAYOUT (DEPLOYMENT READY)
+# ==============================================================================
+st.set_page_config(page_title="Say to Words Web AI", page_icon="🤖", layout="wide")
+st.title("🤖 Say to Words - Web AI Transcription Agent")
+st.caption("Production Build: Audio Normalization Engine Enabled (Anti-Shouting + Background Cancellation Filter)")
 
-                        # 2. Groq LLM Response Generation
-                        with st.spinner("🤖 Generating Agent Response ..."):
-                            try:
-                                chat_completion = groq_client.chat.completions.create(
-                                    messages=[
-                                        {
-                                            "role": "system",
-                                            "content": "You are a helpful AI assistant. Answer the user queries accurately and concisely in Roman Urdu or English depending on their input."
-                                        },
-                                        {
-                                            "role": "user",
-                                            "content": text_from_voice
-                                        }
-                                    ],
-                                    model="llama-3.1-8b-instant",
-                                )
-                                response_text = chat_completion.choices[0].message.content
-                                st.session_state.ai_response = response_text
-                                
-                                st.markdown("### 🤖 Agent Response:")
-                                st.success(response_text)
+# Sidebar configurations controls panel
+st.sidebar.header("⚙️ Model Architecture Settings")
+model_size = st.sidebar.selectbox("Whisper Model Scale", ["tiny", "base", "small", "medium"], index=1)
+device_choice = st.sidebar.selectbox("Execution Hardware", ["cpu", "cuda"], index=0)
+compute_choice = st.sidebar.selectbox("Quantization Compute Type", ["int8", "float16"], index=0)
 
-                            except Exception as groq_err:
-                                st.error(f"Groq Error: {groq_err}")
+st.sidebar.markdown("---")
+st.sidebar.header("🎯 Transcription Tuning")
+beam_size_val = st.sidebar.slider("Beam Size Accuracy", 1, 10, 5)
+use_vad = st.sidebar.checkbox("Enable Voice Activity Detection (VAD Filter)", value=True)
+output_ext = st.sidebar.selectbox("Export File Target Format", ["txt", "json", "srt", "vtt"], index=0)
 
-                    else:
-                        st.warning("⚠️ No recognizable speech found in the audio.")
-                except Exception as e:
-                    st.error(f"❌ Transcription error: {e}")
+# Main container file upload dropzone
+uploaded_file = st.file_uploader("Upload your Audio File (MP3, WAV, M4A, etc.)", type=["mp3", "wav", "m4a", "ogg"])
 
-# Clear & Reset Controls
-st.divider()
-if st.button("🗑️ Clear & Reset", use_container_width=True):
-    st.session_state.last_transcription = ""
-    st.session_state.ai_response = ""
-    st.rerun()
+if uploaded_file is not None:
+    st.info(f"📁 Target Received: `{uploaded_file.name}`. Initializing Acoustic Matrix filters...")
+    
+    @st.cache_resource(show_spinner=False)
+    def initialize_service(m_size, dev, comp):
+        return TranscriptionService(model_size=m_size, device=dev, compute_type=comp)
+        
+    try:
+        service = initialize_service(model_size, device_choice, compute_choice)
+        
+        # Setup temporary directories cleanly
+        temp_dir = Path("temp_workspace")
+        temp_dir.mkdir(exist_ok=True)
+        temp_audio_path = temp_dir / uploaded_file.name
+        
+        with open(temp_audio_path, "wb") as f:
