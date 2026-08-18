@@ -146,8 +146,10 @@ def transcribe_with_deepgram(processed_bytes, debug=False):
 # ============================
 # 🎚️ AUDIO PROCESSING HELPERS (Noise & VAD)
 # ============================
-MIN_RMS_ENERGY = 35.0
+MIN_RMS_ENERGY = 55.0
+#old is 35.0
 MIN_DURATION_SECONDS = 0.45
+
 MAX_DURATION_SECONDS = 120
 VAD_FRAME_MS = 30
 MIN_SPEECH_SECONDS = 0.20
