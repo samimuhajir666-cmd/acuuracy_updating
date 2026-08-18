@@ -11,13 +11,13 @@ import streamlit as st
 from dotenv import load_dotenv
 from streamlit_mic_recorder import mic_recorder
 from unidecode import unidecode
-
+from groq import Groq
 
 # ============================
 # 🖥️ STREAMLIT PAGE CONFIG
 # ============================
 st.set_page_config(
-    page_title="AI Speech-to-Text - Deepgram Nova-3",
+    page_title="AI Agent - Speech to Text & Brain",
     page_icon="🎤",
     layout="centered",
 )
@@ -38,6 +38,23 @@ if not DEEPGRAM_API_KEY:
     st.error("DEEPGRAM_API_KEY not found. Put it in .env or Streamlit Secrets.")
     st.stop()
 
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+if not GROQ_API_KEY:
+    try:
+        GROQ_API_KEY = st.secrets.get("GROQ_API_KEY")
+    except Exception:
+        GROQ_API_KEY = None
+
+if not GROQ_API_KEY:
+    st.error("GROQ_API_KEY not found. Put it in .env or Streamlit Secrets.")
+    st.stop()
+
+# Initialize Groq Client for LLM Response
+try:
+    groq_client = Groq(api_key=GROQ_API_KEY)
+except Exception as e:
+    st.error(f"Groq Client Initialization Error: {e}")
+    st.stop()
 
 # ============================
 # 🎙️ DEEPGRAM CONFIGURATION
@@ -127,7 +144,7 @@ def transcribe_with_deepgram(processed_bytes, debug=False):
     }
 
 # ============================
-# 🎚️ AUDIO PROCESSING HELPERS
+# 🎚️ AUDIO PROCESSING HELPERS (Noise & VAD)
 # ============================
 MIN_RMS_ENERGY = 35.0
 MIN_DURATION_SECONDS = 0.45
@@ -199,13 +216,15 @@ def process_audio_buffer(audio_bytes, debug=False):
 # ============================
 if "last_transcription" not in st.session_state:
     st.session_state.last_transcription = ""
+if "ai_response" not in st.session_state:
+    st.session_state.ai_response = ""
 
 # ============================
 # 🧩 UI DESIGN & LAYOUT
 # ============================
-st.title("🎤 Deepgram Nova-3 Speech-to-Text")
-st.caption("Powered by Deepgram Nova-3 Multi-Language Model")
-st.info("Record your voice below to instantly transcribe it into text.")
+st.title("🎤 AI Speech-to-Text & Agent Brain")
+st.caption("Deepgram Nova-3 • Groq Llama-3.1-8b-instant")
+st.info("Record your voice below. The agent will transcribe it using Deepgram and answer using Groq.")
 
 # Microphone Widget
 audio_output = mic_recorder(
@@ -221,7 +240,7 @@ if audio_output:
     audio_bytes = audio_output.get("bytes")
 
     if audio_bytes:
-        with st.spinner("⏳ Processing audio buffer..."):
+        with st.spinner("⏳ Processing audio buffer & filtering noise..."):
             result = process_audio_buffer(audio_bytes)
 
         if result is None:
@@ -229,7 +248,7 @@ if audio_output:
         else:
             processed_bytes = result["processed_bytes"]
 
-            # Deepgram Transcription
+            # 1. Deepgram Transcription
             with st.spinner("⚡ Transcribing with Deepgram Nova-3..."):
                 try:
                     transcription_result = transcribe_with_deepgram(processed_bytes)
@@ -239,8 +258,34 @@ if audio_output:
                     if text_from_voice:
                         st.session_state.last_transcription = text_from_voice
                         st.success("✅ Transcribed successfully using Deepgram Nova-3")
-                        st.markdown(f"**Transcription:** {text_from_voice}")
+                        st.markdown(f"**User Said:** {text_from_voice}")
                         st.caption(f"Confidence: {confidence:.2f}")
+
+                        # 2. Groq LLM Response Generation
+                        with st.spinner("🤖 Generating Agent Response (Powered by Groq)..."):
+                            try:
+                                chat_completion = groq_client.chat.completions.create(
+                                    messages=[
+                                        {
+                                            "role": "system",
+                                            "content": "You are a helpful AI assistant. Answer the user queries accurately and concisely in Roman Urdu or English depending on their input."
+                                        },
+                                        {
+                                            "role": "user",
+                                            "content": text_from_voice
+                                        }
+                                    ],
+                                    model="llama-3.1-8b-instant",
+                                )
+                                response_text = chat_completion.choices[0].message.content
+                                st.session_state.ai_response = response_text
+                                
+                                st.markdown("### 🤖 Agent Response:")
+                                st.success(response_text)
+
+                            except Exception as groq_err:
+                                st.error(f"Groq Error: {groq_err}")
+
                     else:
                         st.warning("⚠️ No recognizable speech found in the audio.")
                 except Exception as e:
@@ -250,4 +295,5 @@ if audio_output:
 st.divider()
 if st.button("🗑️ Clear & Reset", use_container_width=True):
     st.session_state.last_transcription = ""
+    st.session_state.ai_response = ""
     st.rerun()
