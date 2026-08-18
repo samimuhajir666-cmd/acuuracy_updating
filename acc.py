@@ -216,7 +216,6 @@ uploaded_file = st.file_uploader("Upload your Audio File (MP3, WAV, M4A, etc.)",
 if uploaded_file is not None:
     st.info(f"📁 Target Received: `{uploaded_file.name}`. Initializing Acoustic Matrix filters...")
     
-    # FIXED: Indentation block corrected perfectly from here onwards
     @st.cache_resource(show_spinner=False)
     def initialize_service(m_size, dev, comp):
         return TranscriptionService(model_size=m_size, device=dev, compute_type=comp)
@@ -227,3 +226,37 @@ if uploaded_file is not None:
         # Setup temporary directories cleanly
         temp_dir = Path("temp_workspace")
         temp_dir.mkdir(exist_ok=True)
+        
+        temp_audio_path = temp_dir / uploaded_file.name
+        with open(temp_audio_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+            
+        if st.button("🚀 Start Transcription Process"):
+            with st.spinner("⚡ Transcribing audio with Faster-Whisper AI Engine..."):
+                result, export_path = service.transcribe_file(
+                    temp_audio_path,
+                    output_format=output_ext,
+                    beam_size=beam_size_val,
+                    vad_filter=use_vad
+                )
+                
+            st.success("🎉 Transcription completed successfully!")
+            
+            st.subheader("📝 Transcribed Output")
+            st.text_area("Full Text Result", value=result["text"], height=250)
+            
+            # File download button
+            with open(export_path, "rb") as file_data:
+                st.download_button(
+                    label=f"📥 Download Transcription ({output_ext.upper()})",
+                    data=file_data,
+                    file_name=export_path.name,
+                    mime="text/plain"
+                )
+                
+            # Cleanup source uploaded file from temp workspace
+            if temp_audio_path.exists():
+                os.remove(temp_audio_path)
+
+    except Exception as err:
+        st.error(f"❌ Error during transcription execution: {err}")
