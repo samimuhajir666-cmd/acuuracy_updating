@@ -222,7 +222,7 @@ if uploaded_file is not None:
         
     try:
         service = initialize_service(model_size, device_choice, compute_choice)
-        #jafghiuabnfdgh
+        #jafghiuabnfdghhsh
         # Setup temporary directories cleanly
         temp_dir = Path("temp_workspace")
         temp_dir.mkdir(exist_ok=True)
