@@ -10,7 +10,7 @@ from datetime import datetime
 from faster_whisper import WhisperModel
 
 # ==============================================================================
-# 🛠️ TRANSCRIPTION SERVICE CLASS (YOUR ENGINE WITH BACKGROUND & LOUDNESS FIXES)
+# 🛠️ TRANSCRIPTION SERVICE CLASS (ENGINE WITH BACKGROUND & LOUDNESS FIXES)
 # ==============================================================================
 class TranscriptionService:
     """Production-ready transcription service using faster-whisper with DSP overrides."""
@@ -215,20 +215,15 @@ uploaded_file = st.file_uploader("Upload your Audio File (MP3, WAV, M4A, etc.)",
 
 if uploaded_file is not None:
     st.info(f"📁 Target Received: `{uploaded_file.name}`. Initializing Acoustic Matrix filters...")
-           # Setup temporary directories cleanly
+    
+    # FIXED: Indentation block corrected perfectly from here onwards
+    @st.cache_resource(show_spinner=False)
+    def initialize_service(m_size, dev, comp):
+        return TranscriptionService(model_size=m_size, device=dev, compute_type=comp)
+        
+    try:
+        service = initialize_service(model_size, device_choice, compute_choice)
+        
+        # Setup temporary directories cleanly
         temp_dir = Path("temp_workspace")
         temp_dir.mkdir(exist_ok=True)
-        temp_audio_path = temp_dir / uploaded_file.name
-        
-        with open(temp_audio_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-            
-        if st.button("🚀 Transcribe Audio Matrix"):
-            with st.spinner("Analyzing vocal frequencies..."):
-                
-                transcribe_args = {
-                    "audio_path": temp_audio_path,
-                    "output_format": output_ext,
-                    "beam_size": beam_size_val,
-                    "vad_filter": use_vad
-                }
