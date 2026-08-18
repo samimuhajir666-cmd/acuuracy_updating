@@ -1,9 +1,5 @@
-streamlit
-requests
-numpy
-scipy
-noisereduce
-streamlit-mic-recorder
-unidecode
-python-dotenv
-groq
+streamlit==1.42.0
+faster-whisper==1.0.3
+numpy==1.26.4
+scipy==1.12.0
+noisereduce==3.0.2
