@@ -1,258 +1,299 @@
 import io
 import os
-import tempfile
-import numpy as np
+import re
+import html
 import requests
+import numpy as np
 import scipy.io.wavfile as wav
 import scipy.signal as signal
+import noisereduce as nr
 import streamlit as st
 from dotenv import load_dotenv
 from streamlit_mic_recorder import mic_recorder
 from unidecode import unidecode
-
-# Optional Local Whisper Import
-try:
-    from faster_whisper import WhisperModel
-    HAS_FASTER_WHISPER = True
-except ImportError:
-    HAS_FASTER_WHISPER = False
+from groq import Groq
 
 # ============================
-# 🖥️ PAGE CONFIG & ENVS
+# 🖥️ STREAMLIT PAGE CONFIG
 # ============================
 st.set_page_config(
-    page_title="Multi-LLM Voice AI Agent",
-    page_icon="🤖",
-    layout="wide"
+    page_title="AI Agent - Speech to Text & Brain",
+    page_icon="🎤",
+    layout="centered",
 )
 
 load_dotenv()
 
-DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY") or st.secrets.get("DEEPGRAM_API_KEY", None)
-GROQ_API_KEY = os.getenv("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY", None)
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
+# ============================
+# 🔑 API KEYS SETUP
+# ============================
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
+if not DEEPGRAM_API_KEY:
+    try:
+        DEEPGRAM_API_KEY = st.secrets.get("DEEPGRAM_API_KEY")
+    except Exception:
+        DEEPGRAM_API_KEY = None
 
-TECHNICAL_VOCAB = [
-    "Python", "Streamlit", "FastAPI", "Django", "JavaScript", 
-    "Deepgram", "Groq", "Whisper", "OpenAI", "POS", "API",
-    "Machine Learning", "System Error", "Troubleshoot"
+if not DEEPGRAM_API_KEY:
+    st.error("DEEPGRAM_API_KEY not found. Put it in .env or Streamlit Secrets.")
+    st.stop()
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+if not GROQ_API_KEY:
+    try:
+        GROQ_API_KEY = st.secrets.get("GROQ_API_KEY")
+    except Exception:
+        GROQ_API_KEY = None
+
+if not GROQ_API_KEY:
+    st.error("GROQ_API_KEY not found. Put it in .env or Streamlit Secrets.")
+    st.stop()
+
+# Initialize Groq Client for LLM Response
+try:
+    groq_client = Groq(api_key=GROQ_API_KEY)
+except Exception as e:
+    st.error(f"Groq Client Initialization Error: {e}")
+    st.stop()
+
+# ============================
+# 🎙️ DEEPGRAM CONFIGURATION
+# ============================
+DEEPGRAM_API_URL = "https://api.deepgram.com/v1/listen"
+DEEPGRAM_MODEL = "nova-3"
+DEEPGRAM_LANGUAGE = "multi"
+DEEPGRAM_TIMEOUT = 60
+
+DEEPGRAM_KEYTERMS = [
+    "Python", "Streamlit", "Jupyter", "Matplotlib", "Plotly",
+    "NumPy", "SciPy", "Deepgram", "AI", "machine learning",
+    "deep learning", "API", "API key", "variable", "function",
+    "class", "list", "dictionary", "tuple", "integer", "string",
+    "float", "Flask", "FastAPI", "JavaScript", "HTML", "CSS",
 ]
 
-SYSTEM_PROMPT = (
-    "Aap ek highly intelligent technical support AI agent hain. "
-    "User ke masle ka jawab concise, clear, aur polite Roman Urdu / English mixed format mein dein."
-)
+def force_roman_script(text):
+    if not text:
+        return text
+    has_non_ascii = bool(re.search(r'[^\x00-\x7F]', text))
+    if not has_non_ascii:
+        return text
+    return unidecode(text)
 
 # ============================
-# 🎚️ AUDIO PRE-PROCESSING
+# 🎙️ DEEPGRAM TRANSCRIBE
 # ============================
-def clean_audio_signal(audio_bytes):
-    """Bandpass filter aur normalization se voice clear karna."""
-    try:
-        audio_file = io.BytesIO(audio_bytes)
-        sample_rate, audio_data = wav.read(audio_file)
-
-        if len(audio_data.shape) > 1:
-            audio_data = np.mean(audio_data, axis=1)
-
-        audio_data = audio_data.astype(np.float64)
-        
-        # Bandpass filter (70Hz - 7600Hz)
-        nyquist = 0.5 * sample_rate
-        low = max(0.001, 70 / nyquist)
-        high = min(0.99, 7600 / nyquist)
-        b, a = signal.butter(3, [low, high], btype="band")
-        filtered = signal.filtfilt(b, a, audio_data)
-
-        # Peak Normalization
-        max_val = np.max(np.abs(filtered))
-        if max_val > 1e-8:
-            filtered = (filtered / max_val) * 32767.0
-
-        processed = np.clip(filtered, -32768, 32767).astype(np.int16)
-        output_buffer = io.BytesIO()
-        wav.write(output_buffer, sample_rate, processed)
-        output_buffer.seek(0)
-        return output_buffer.read()
-    except Exception:
-        return audio_bytes
-
-# ============================
-# 🎙️ STT ENGINES (Transcribers)
-# ============================
-
-# 1. Deepgram Engine
-def transcribe_deepgram(audio_bytes):
-    if not DEEPGRAM_API_KEY:
-        raise ValueError("Deepgram API Key missing hai! .env check karein.")
-
+def transcribe_with_deepgram(processed_bytes, debug=False):
     params = [
-        ("model", "nova-3"),
-        ("language", "multi"),
+        ("model", DEEPGRAM_MODEL),
+        ("language", DEEPGRAM_LANGUAGE),
         ("smart_format", "true"),
         ("punctuate", "true"),
+        ("utterances", "true"),
+        ("numerals", "true"),
     ]
-    for term in TECHNICAL_VOCAB:
+
+    for term in DEEPGRAM_KEYTERMS:
         params.append(("keyterm", term))
 
     headers = {
         "Authorization": f"Token {DEEPGRAM_API_KEY}",
         "Content-Type": "audio/wav",
     }
-    res = requests.post("https://api.deepgram.com/v1/listen", params=params, headers=headers, data=audio_bytes, timeout=30)
-    if res.status_code != 200:
-        raise RuntimeError(f"Deepgram Error: {res.text[:200]}")
-
-    data = res.json()
-    channels = data.get("results", {}).get("channels", [])
-    if channels and channels[0].get("alternatives"):
-        alt = channels[0]["alternatives"][0]
-        return unidecode(alt.get("transcript", "")), float(alt.get("confidence", 0.0))
-    return "", 0.0
-
-# 2. Faster-Whisper Engine (Local)
-@st.cache_resource(show_spinner="Local Whisper Load Ho Raha Hai...")
-def get_whisper_model():
-    if not HAS_FASTER_WHISPER:
-        return None
-    return WhisperModel("base", device="cpu", compute_type="int8")
-
-def transcribe_whisper(audio_bytes):
-    model = get_whisper_model()
-    if not model:
-        raise RuntimeError("faster-whisper package missing hai!")
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-        tmp.write(audio_bytes)
-        tmp_path = tmp.name
 
     try:
-        segments, info = model.transcribe(
-            tmp_path,
-            beam_size=8,
-            temperature=0.0,
-            vad_filter=True,
-            initial_prompt="Keywords: " + ", ".join(TECHNICAL_VOCAB)
+        response = requests.post(
+            DEEPGRAM_API_URL,
+            params=params,
+            headers=headers,
+            data=processed_bytes,
+            timeout=DEEPGRAM_TIMEOUT,
         )
-        text = " ".join([s.text.strip() for s in segments]).strip()
-        return unidecode(text), float(info.language_probability)
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+    except requests.RequestException as e:
+        if debug:
+            st.exception(e)
+        raise RuntimeError(f"Could not reach Deepgram: {e}") from e
 
-# ============================
-# 🤖 MULTI-LLM ENGINES
-# ============================
+    if response.status_code != 200:
+        detail = response.text[:1200]
+        raise RuntimeError(f"Deepgram API error {response.status_code}: {detail}")
 
-# LLM 1: Groq (Llama 3.3 70B - Ultra Fast)
-def get_groq_response(user_text):
-    if not GROQ_API_KEY:
-        return "❌ GROQ_API_KEY missing hai!"
-    
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": "llama3-8b-8192",
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_text}
-        ],
-        "temperature": 0.3
+    try:
+        data = response.json()
+    except Exception as e:
+        raise RuntimeError("Deepgram returned invalid JSON.") from e
+
+    results = data.get("results", {})
+    channels = results.get("channels", [])
+
+    if not channels:
+        return {"text": "", "confidence": 0.0, "raw": data}
+
+    alternatives = channels[0].get("alternatives", [])
+    if not alternatives:
+        return {"text": "", "confidence": 0.0, "raw": data}
+
+    alternative = alternatives[0]
+    transcript = (alternative.get("transcript") or "").strip()
+    confidence = float(alternative.get("confidence", 0.0) or 0.0)
+
+    return {
+        "text": force_roman_script(transcript),
+        "confidence": confidence,
+        "raw": data,
     }
-    res = requests.post(url, json=payload, headers=headers, timeout=20)
-    if res.status_code == 200:
-        return res.json()["choices"][0]["message"]["content"]
-    return f"Groq Error ({res.status_code}): {res.text[:150]}"
-
-# LLM 2: OpenAI (GPT-4o Mini / GPT-4o)
-def get_openai_response(user_text):
-    if not OPENAI_API_KEY:
-        return "❌ OPENAI_API_KEY missing hai!"
-
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": "gpt-4o-mini",  # Highly accurate & cost efficient
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_text}
-        ],
-        "temperature": 0.3
-    }
-    res = requests.post(url, json=payload, headers=headers, timeout=20)
-    if res.status_code == 200:
-        return res.json()["choices"][0]["message"]["content"]
-    return f"OpenAI Error ({res.status_code}): {res.text[:150]}"
 
 # ============================
-# 🖥️ STREAMLIT UI
+# 🎚️ AUDIO PROCESSING HELPERS
 # ============================
-def main():
-    st.title("🤖 Multi-Model AI Voice Agent")
-    st.caption("Select your preferred Speech-to-Text Engine and LLM Intelligence below.")
+MIN_RMS_ENERGY = 35.0
+MIN_DURATION_SECONDS = 0.45
+MAX_DURATION_SECONDS = 120
+VAD_FRAME_MS = 30
+MIN_SPEECH_SECONDS = 0.20
+NOISE_FLOOR_PERCENTILE = 10
+SPEECH_ABOVE_NOISE_FACTOR = 2.0
 
-    # Sidebar Controls
-    st.sidebar.header("⚙️ Model Pipeline Selection")
+def frame_energies(audio_data, sample_rate, frame_ms=VAD_FRAME_MS):
+    frame_len = max(1, int(sample_rate * frame_ms / 1000))
+    energies = []
+    for start in range(0, len(audio_data), frame_len):
+        chunk = audio_data[start:start + frame_len]
+        if len(chunk) == 0:
+            continue
+        energies.append(float(np.sqrt(np.mean(chunk.astype(np.float64) ** 2))))
+    return energies
 
-    # STT Model Switcher
-    stt_choice = st.sidebar.selectbox(
-        "1. Select Speech-to-Text Model:",
-        ["⚡ Deepgram Nova-3 (Cloud / Recommended)", "💻 Faster-Whisper (Local CPU)"]
-    )
+def contains_real_speech(audio_data, sample_rate):
+    if audio_data is None or len(audio_data) == 0:
+        return False
+    energies = frame_energies(audio_data, sample_rate)
+    if not energies:
+        return False
+    noise_floor = np.percentile(energies, NOISE_FLOOR_PERCENTILE)
+    dynamic_threshold = max(noise_floor * SPEECH_ABOVE_NOISE_FACTOR, MIN_RMS_ENERGY)
+    speech_frame_count = sum(1 for energy in energies if energy > dynamic_threshold)
+    speech_seconds = speech_frame_count * VAD_FRAME_MS / 1000.0
+    return speech_seconds >= MIN_SPEECH_SECONDS
 
-    # LLM Model Switcher
-    llm_choice = st.sidebar.selectbox(
-        "2. Select LLM Agent Brain:",
-        ["🔥 Groq (Llama-3.3 70B - Ultra Fast)", "🧠 OpenAI (GPT-4o Mini)"]
-    )
+def process_audio_buffer(audio_bytes, debug=False):
+    try:
+        audio_file = io.BytesIO(audio_bytes)
+        sample_rate, audio_data = wav.read(audio_file)
 
-    enable_filter = st.sidebar.checkbox("✨ Noise & Audio Filter", value=True)
+        if sample_rate <= 0:
+            return None
 
-    st.markdown("---")
-    st.subheader("🎤 Speak to Agent")
+        if len(audio_data.shape) > 1:
+            audio_data = np.mean(audio_data, axis=1)
 
-    audio = mic_recorder(
-        start_prompt="🔴 Record Voice",
-        stop_prompt="⬛ Stop Recording",
-        key="voice_rec"
-    )
+        audio_data = audio_data.astype(np.float64)
+        duration = len(audio_data) / float(sample_rate)
 
-    if audio and audio.get("bytes"):
-        raw_bytes = audio["bytes"]
-        st.audio(raw_bytes, format="audio/wav")
+        if duration < MIN_DURATION_SECONDS or duration > MAX_DURATION_SECONDS:
+            return None
 
-        if st.button("🚀 Process & Get Agent Jawab"):
-            with st.spinner("Processing Voice & Pipeline..."):
-                cleaned_bytes = clean_audio_signal(raw_bytes) if enable_filter else raw_bytes
+        if not contains_real_speech(audio_data, sample_rate):
+            return None
 
+        audio_data = np.clip(audio_data, -32768, 32767).astype(np.int16)
+        output_buffer = io.BytesIO()
+        wav.write(output_buffer, sample_rate, audio_data)
+        output_buffer.seek(0)
+
+        return {
+            "processed_bytes": output_buffer.read(),
+            "sample_rate": int(sample_rate),
+            "duration": float(duration),
+        }
+    except Exception as e:
+        if debug:
+            st.exception(e)
+        return None
+
+# ============================
+# 🧠 SESSION STATE
+# ============================
+if "last_transcription" not in st.session_state:
+    st.session_state.last_transcription = ""
+if "ai_response" not in st.session_state:
+    st.session_state.ai_response = ""
+
+# ============================
+# 🧩 UI DESIGN & LAYOUT
+# ============================
+st.title("🎤 AI Speech-to-Text & Agent Brain")
+st.caption("Deepgram Nova-3 • Groq Llama-3.1-8b-instant")
+st.info("Record your voice below. The agent will transcribe it using Deepgram and answer using Groq.")
+
+# Microphone Widget
+audio_output = mic_recorder(
+    start_prompt="🔴 Record Voice",
+    stop_prompt="⏹️ Stop Recording",
+    just_once=True,
+    use_container_width=True,
+    format="wav",
+    key="listener_mic",
+)
+
+if audio_output:
+    audio_bytes = audio_output.get("bytes")
+
+    if audio_bytes:
+        with st.spinner("⏳ Processing audio buffer..."):
+            result = process_audio_buffer(audio_bytes)
+
+        if result is None:
+            st.warning("⚠️ Recording was too quiet or short. Please speak clearly and try again.")
+        else:
+            processed_bytes = result["processed_bytes"]
+
+            # 1. Deepgram Transcription
+            with st.spinner("⚡ Transcribing with Deepgram Nova-3..."):
                 try:
-                    # 1. Transcribe Step
-                    if "Deepgram" in stt_choice:
-                        transcript, conf = transcribe_deepgram(cleaned_bytes)
-                        engine_used = "Deepgram Nova-3"
+                    transcription_result = transcribe_with_deepgram(processed_bytes)
+                    text_from_voice = transcription_result["text"].strip()
+                    confidence = float(transcription_result["confidence"])
+
+                    if text_from_voice:
+                        st.session_state.last_transcription = text_from_voice
+                        st.success("✅ Transcribed successfully using Deepgram Nova-3")
+                        st.markdown(f"**User Said:** {text_from_voice}")
+                        st.caption(f"Confidence: {confidence:.2f}")
+
+                        # 2. Groq LLM Response Generation (Using active model: llama-3.1-8b-instant)
+                        with st.spinner("🤖 Generating Agent Response (Powered by Groq)..."):
+                            try:
+                                chat_completion = groq_client.chat.completions.create(
+                                    messages=[
+                                        {
+                                            "role": "system",
+                                            "content": "You are a helpful AI assistant. Answer the user queries accurately and concisely in Roman Urdu or English depending on their input."
+                                        },
+                                        {
+                                            "role": "user",
+                                            "content": text_from_voice
+                                        }
+                                    ],
+                                    model="llama-3.1-8b-instant",
+                                )
+                                response_text = chat_completion.choices[0].message.content
+                                st.session_state.ai_response = response_text
+                                
+                                st.markdown("### 🤖 Agent Response:")
+                                st.success(response_text)
+
+                            except Exception as groq_err:
+                                st.error(f"Groq Error: {groq_err}")
+
                     else:
-                        transcript, conf = transcribe_whisper(cleaned_bytes)
-                        engine_used = "Faster-Whisper (Local)"
-
-                    st.success(f"✅ Transcribed using **{engine_used}**")
-                    st.info(f"**User Said:** {transcript if transcript else 'No speech detected.'}")
-                    st.caption(f"Confidence: {conf:.2f}")
-
-                    # 2. LLM Processing Step
-                    if transcript:
-                        with st.spinner("LLM Processing..."):
-                            if "Groq" in llm_choice:
-                                response = get_groq_response(transcript)
-                                brain_used = "Groq Llama-3.3"
-                            else:
-                                response = get_openai_response(transcript)
-                                brain_used = "OpenAI GPT-4o Mini"
-
-                            st.markdown(f"### 🤖 Agent Response (*Powered by {brain_used}*):")
-                            st.success(response)
-
+                        st.warning("⚠️ No recognizable speech found in the audio.")
                 except Exception as e:
-                    st.error(f"❌ Error in Pipeline: {str(e)}")
+                    st.error(f"❌ Transcription error: {e}")
 
-if __name__ == "__main__":
-    main()
+# Clear & Reset Controls
+st.divider()
+if st.button("🗑️ Clear & Reset", use_container_width=True):
+    st.session_state.last_transcription = ""
+    st.session_state.ai_response = ""
+    st.rerun()
