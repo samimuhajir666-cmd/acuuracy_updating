@@ -226,7 +226,7 @@ if "ai_response" not in st.session_state:
 # ============================
 st.title("🎤 AI Speech-to-Text & Agent Brain")
 st.caption("Deepgram Nova-3 • Groq Llama-3.1-8b-instant")
-st.info("Record your voice below. The agent will transcribe it using Deepgram and answer using Groq.")
+st.info("Record your voice below. The agent will transcribe your voice.")
 
 # Microphone Widget
 audio_output = mic_recorder(
@@ -264,7 +264,7 @@ if audio_output:
                         st.caption(f"Confidence: {confidence:.2f}")
 
                         # 2. Groq LLM Response Generation
-                        with st.spinner("🤖 Generating Agent Response (Powered by Groq)..."):
+                        with st.spinner("🤖 Generating Agent Response ..."):
                             try:
                                 chat_completion = groq_client.chat.completions.create(
                                     messages=[
