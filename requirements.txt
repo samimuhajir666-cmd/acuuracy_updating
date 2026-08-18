@@ -1,8 +1,9 @@
 streamlit
-streamlit-mic-recorder
 requests
 numpy
 scipy
-python-dotenv
+noisereduce
+streamlit-mic-recorder
 unidecode
-faster-whisper
+python-dotenv
+groq
