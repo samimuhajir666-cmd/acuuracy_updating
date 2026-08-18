@@ -6,4 +6,3 @@ noisereduce
 streamlit-mic-recorder
 unidecode
 python-dotenv
-groq
