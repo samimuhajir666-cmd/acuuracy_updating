@@ -11,7 +11,7 @@ import streamlit as st
 from dotenv import load_dotenv
 from streamlit_mic_recorder import mic_recorder
 from unidecode import unidecode
-from groq import Groq
+
 
 # ============================
 # 🖥️ STREAMLIT PAGE CONFIG
@@ -38,23 +38,6 @@ if not DEEPGRAM_API_KEY:
     st.error("DEEPGRAM_API_KEY not found. Put it in .env or Streamlit Secrets.")
     st.stop()
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-if not GROQ_API_KEY:
-    try:
-        GROQ_API_KEY = st.secrets.get("GROQ_API_KEY")
-    except Exception:
-        GROQ_API_KEY = None
-
-if not GROQ_API_KEY:
-    st.error("GROQ_API_KEY not found. Put it in .env or Streamlit Secrets.")
-    st.stop()
-
-# Initialize Groq Client for LLM Response
-try:
-    groq_client = Groq(api_key=GROQ_API_KEY)
-except Exception as e:
-    st.error(f"Groq Client Initialization Error: {e}")
-    st.stop()
 
 # ============================
 # 🎙️ DEEPGRAM CONFIGURATION
